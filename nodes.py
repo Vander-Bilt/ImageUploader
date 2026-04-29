@@ -41,17 +41,25 @@ class ImageUploader:
     def tensor_to_pil(self, tensor: torch.Tensor) -> Image.Image:
         """
         将单个 [H,W,C] 的 tensor 转换为 PIL.Image
-        ComfyUI 的 IMAGE 是 [0,1] 范围的 float32，需要转 [0,255] uint8
+        自动兼容 RGB(3通道) 和 RGBA(4通道)
         """
-        # 确保在 CPU 上操作
         if tensor.is_cuda:
             tensor = tensor.cpu()
         
-        # [H,W,C] float32 [0,1] → [H,W,C] uint8 [0,255]
         np_image = (tensor.numpy() * 255.0).astype(np.uint8)
+        channels = np_image.shape[-1] if np_image.ndim == 3 else 3
         
-        # 创建 PIL Image (RGB 模式)
-        pil_image = Image.fromarray(np_image, mode='RGB')
+        # ✅ 根据通道数自动选择模式
+        if channels == 4:
+            pil_image = Image.fromarray(np_image, mode='RGBA')
+        elif channels == 3:
+            pil_image = Image.fromarray(np_image, mode='RGB')
+        elif channels == 1:
+            pil_image = Image.fromarray(np_image.squeeze(), mode='L')
+        else:
+            #  fallback: 强制取前3通道
+            pil_image = Image.fromarray(np_image[:, :, :3], mode='RGB')
+        
         return pil_image
 
     def pil_to_bytes(self, pil_image: Image.Image, format: str = 'PNG') -> bytes:
