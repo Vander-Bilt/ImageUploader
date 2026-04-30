@@ -28,8 +28,10 @@
 
 - 🔄 **批量上传**：支持一次性上传多张图片（Batch 处理）
 - 🔗 **灵活配置**：自定义 API 基础地址和上传端点
+- 🧠 **特征提取**：支持上传图片特征向量（兼容 `CLIP_VISION_OUTPUT`），支持自动池化与半精度压缩（float16）
+- 🏷️ **标签支持**：支持为图片添加多标签，提供灵活的解析规则（按行匹配或全量应用）
 - 🖼️ **格式兼容**：自动将 ComfyUI 的 `[B,H,W,C]` Tensor 转换为 PNG 字节流
-- 📦 **结构化返回**：同时返回 URL 字符串（方便预览）和完整 JSON 响应（方便后续节点处理）
+- 📦 **混合上传**：采用 `multipart/form-data` 格式，同时发送图片二进制、特征向量及元数据
 - 🛡️ **错误处理**：单个图片上传失败不影响其他图片，错误信息清晰可见
 - ⏱️ **超时配置**：默认 300 秒超时，支持大文件上传
 
@@ -77,20 +79,33 @@ pip install -r requirements.txt  # 如果有的话
 
 | 参数名 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `images` | `IMAGE` | - | 接收 ComfyUI 标准图片格式 `[B,H,W,C]`，值域 `[0,1]` |
-| `api_base_url` | `STRING` | `http://localhost:3011` | API 服务的基础地址，如 `https://api.example.com` |
-| `upload_endpoint` | `STRING` | `/upload-image-binary` | 上传接口的路径，将自动与 base_url 拼接 |
+| `images` | `IMAGE` | - | 接收 ComfyUI 标准图片格式 `[B,H,W,C]` |
+| `api_base_url` | `STRING` | `http://localhost:3011` | API 服务的基础地址 |
+| `upload_endpoint` | `STRING` | `/upload-image-binary` | 上传接口的路径 |
 
-### 可选扩展（开发中）
-
-> 后续版本计划支持以下可选参数：
+### 可选参数（Optional）
 
 | 参数名 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `timeout` | `INT` | `300` | 请求超时时间（秒） |
-| `retry_count` | `INT` | `0` | 上传失败自动重试次数 |
-| `image_format` | `["PNG","JPEG"]` | `PNG` | 输出图片格式 |
-| `headers` | `JSON` | `{}` | 自定义请求头（如 Authorization） |
+| `features` | `CLIP_VISION_OUTPUT` | - | 图片特征向量。支持自动池化（CLS/Mean）及 float16 压缩 |
+| `labels` | `STRING` | - | 图片标签。详见 [标签解析规则](#-标签解析规则) |
+
+### 🚀 路线图（规划中）
+
+- [ ] `timeout`: 支持自定义请求超时时间
+- [ ] `headers`: 支持自定义 HTTP 请求头（用于 Token 认证等）
+- [ ] `image_format`: 支持上传为 JPEG/WebP 格式以节省空间
+- [ ] `retry_count`: 失败自动重试机制
+
+---
+
+## 🏷️ 标签解析规则
+
+`labels` 输入框支持多种解析方式：
+
+1. **全局标签**：输入一行文字（如 `cat, outdoor`），该 batch 中**所有图片**都将带上这些标签。
+2. **逐行匹配**：输入多行文字，行数需与图片 Batch 数量一致。每行对应一张图片的标签。
+3. **显式分隔**：使用 `|` 符号分隔每张图的标签组（如 `tag1,tag2 | tag3,tag4`）。
 
 ---
 
@@ -136,60 +151,60 @@ ERROR: Connection timeout
 
 ## 🔌 后端 API 要求
 
-本节点以 **二进制流** 方式上传图片，后端接口需满足：
+本节点采用 `multipart/form-data` 格式上传图片及关联元数据：
 
 ### 请求规范
-```http
-POST /upload-image-binary HTTP/1.1
-Host: api.example.com
-Content-Type: image/png
-
-[binary PNG data]
-```
+- **Method**: `POST`
+- **Body**:
+  - `image`: 文件字段（PNG 格式）
+  - `metadata`: 字符串字段。内容为 JSON 格式的元数据，包含：
+    - `feature_vector`: 浮点数列表（如为 `None` 则不包含）
+    - `labels`: 字符串列表（如为 `None` 则不包含）
+    - `index`: 整数（图片在 Batch 中的索引）
 
 ### 响应规范（成功）
+需包含 `url` 字段供节点解析：
 ```json
 {
   "url": "https://cdn.example.com/uploaded-image.png",
-  "id": "abc123",
-  "message": "Upload successful"
+  "id": "abc123"
 }
 ```
 
-### 响应规范（失败）
-```json
-{
-  "error": "File too large",
-  "code": 413
-}
-```
-
-> 💡 提示：节点会读取响应中的 `url` 字段，请确保成功响应包含该键。
-
-### 示例：FastAPI 后端
+### 示例：FastAPI 后端实现
 ```python
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-import uuid, os
+import json, uuid, os
 
 app = FastAPI()
 
 @app.post("/upload-image-binary")
-async def upload_image(request: Request):
-    # 读取二进制图片数据
-    image_bytes = await request.body()
+async def upload_image(
+    image: UploadFile = File(...),
+    metadata: str = Form(...)
+):
+    # 1. 解析元数据
+    meta_data = json.loads(metadata)
+    feature_vector = meta_data.get("feature_vector")
+    labels = meta_data.get("labels")
     
-    # 生成唯一文件名并保存（示例：本地存储）
+    # 2. 读取图片二进制流
+    content = await image.read()
+    
+    # 3. 执行存储逻辑（示例）
     filename = f"{uuid.uuid4()}.png"
-    save_path = os.path.join("uploads", filename)
-    with open(save_path, "wb") as f:
-        f.write(image_bytes)
+    with open(f"uploads/{filename}", "wb") as f:
+        f.write(content)
     
-    # 返回可访问的 URL
-    return JSONResponse(content={
-        "url": f"https://your-cdn.com/uploads/{filename}",
-        "id": filename.split(".")[0]
-    })
+    # 4. 返回结果
+    return {
+        "url": f"http://your-domain.com/uploads/{filename}",
+        "metadata_received": {
+            "label_count": len(labels) if labels else 0,
+            "has_features": feature_vector is not None
+        }
+    }
 ```
 
 ---
