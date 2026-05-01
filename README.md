@@ -89,6 +89,7 @@ pip install -r requirements.txt  # 如果有的话
 |--------|------|--------|------|
 | `features` | `CLIP_VISION_OUTPUT` | - | 图片特征向量。支持自动池化（CLS/Mean）及 float16 压缩 |
 | `labels` | `STRING` | - | 图片标签。详见 [标签解析规则](#-标签解析规则) |
+| `batchInfo` | `STRING` | `{}` | 总体信息字段。JSON 字符串，包含该 batch 的共有属性（如分类、风格等） |
 
 ### 🚀 路线图（规划中）
 

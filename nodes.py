@@ -37,6 +37,13 @@ class ImageUploader:
                     "multiline": True,
                     "placeholder": "每行一个标签，或用逗号分隔\ne.g. cat, outdoor, sunset\n或\n猫\n户外\n日落"
                 }),
+                
+                # 🔹 新增 3: 总体信息字段（JSON 字符串）
+                "batchInfo": ("STRING", {
+                    "default": "{}",
+                    "multiline": True,
+                    "placeholder": 'e.g. {"category":"办公", "subject":"办公用品", "style":"真实"}'
+                }),
             }
         }
     
@@ -173,7 +180,8 @@ class ImageUploader:
 
     def upload_single_image(self, api_url: str, image_bytes: bytes, 
                           content_type: str, feature_vec: list = None, 
-                          labels: list = None, index: int = 0) -> dict:
+                          labels: list = None, batch_info: dict = None,
+                          index: int = 0) -> dict:
         """调用后端 API 上传单个图片（支持 multipart + JSON 混合）"""
         
         # 方案: 使用 multipart/form-data 同时发送文件和元数据
@@ -187,6 +195,8 @@ class ImageUploader:
             metadata['feature_vector'] = feature_vec
         if labels is not None:
             metadata['labels'] = labels
+        if batch_info is not None:
+            metadata['batch_info'] = batch_info
         metadata['index'] = index  # 图片在 batch 中的序号
         
         
@@ -230,11 +240,19 @@ class ImageUploader:
             }
 
     def upload_images(self, images: torch.Tensor, api_base_url: str, upload_endpoint: str,
-                     features: torch.Tensor = None, labels: str = ""):
+                     features: torch.Tensor = None, labels: str = "", batchInfo: str = "{}"):
         """
-        主函数：处理批量图片上传（支持特征向量 + 标签）
+        主函数：处理批量图片上传（支持特征向量 + 标签 + 总体信息）
         """
         
+        # 🔧 解析总体信息 (JSON)
+        import json
+        try:
+            batch_info_dict = json.loads(batchInfo) if batchInfo else {}
+        except Exception as e:
+            print(f"⚠️ batchInfo JSON 解析失败: {e}")
+            batch_info_dict = {"raw_batch_info": batchInfo}
+            
         # 🔧 类型适配：支持 CLIP_VISION_OUTPUT
         if isinstance(features, dict):
             if "image_embeds" in features:
@@ -287,7 +305,8 @@ class ImageUploader:
             # 3. 调用 API 上传
             result = self.upload_single_image(
                 api_url, img_bytes, 'image/png',
-                feature_vec=feat, labels=lbl, index=i
+                feature_vec=feat, labels=lbl, 
+                batch_info=batch_info_dict, index=i
             )
             results.append(result)
             
