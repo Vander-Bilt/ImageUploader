@@ -31,18 +31,18 @@ class ImageUploader:
             "optional": {
                 "features": ("CLIP_VISION_OUTPUT",),
                 
-                # 🔹 新增 2: 图片标签（支持多标签，逗号/换行分隔）
-                "labels": ("STRING", {
-                    "default": "",
+                # 🔹 新增 2: 扩展信息字段（JSON 字符串）
+                "extra_info": ("STRING", {
+                    "default": "{}",
                     "multiline": True,
-                    "placeholder": "每行一个标签，或用逗号分隔\ne.g. cat, outdoor, sunset\n或\n猫\n户外\n日落"
+                    "placeholder": 'e.g. {"tags": [["tag1", "tag2"], ["tag3"]], "titles": ["title1", "title2"]}'
                 }),
                 
                 # 🔹 新增 3: 总体信息字段（JSON 字符串）
                 "batchInfo": ("STRING", {
                     "default": "{}",
                     "multiline": True,
-                    "placeholder": 'e.g. {"category":"办公", "subject":"办公用品", "style":"真实"}'
+                    "placeholder": 'e.g. {"host"":"neoc", "category":"风景", "collection":"公园", "style":"真实"}'
                 }),
             }
         }
@@ -180,7 +180,8 @@ class ImageUploader:
 
     def upload_single_image(self, api_url: str, image_bytes: bytes, 
                           content_type: str, feature_vec: list = None, 
-                          labels: list = None, batch_info: dict = None,
+                          tags: list = None, title: str = None,
+                          batch_info: dict = None,
                           index: int = 0) -> dict:
         """调用后端 API 上传单个图片（支持 multipart + JSON 混合）"""
         
@@ -188,13 +189,17 @@ class ImageUploader:
         files = {
             'image': (f'image_{index}.png', image_bytes, content_type),
         }
+
+        print(f"🔍 [DEBUG] 图片title: {title} tags: {tags}")
         
         # 构建元数据字段
         metadata = {}
         if feature_vec is not None:
             metadata['feature_vector'] = feature_vec
-        if labels is not None:
-            metadata['labels'] = labels
+        if tags is not None:
+            metadata['tags'] = tags
+        if title is not None:
+            metadata['title'] = title
         if batch_info is not None:
             metadata['batch_info'] = batch_info
         metadata['index'] = index  # 图片在 batch 中的序号
@@ -240,9 +245,9 @@ class ImageUploader:
             }
 
     def upload_images(self, images: torch.Tensor, api_base_url: str, upload_endpoint: str,
-                     features: torch.Tensor = None, labels: str = "", batchInfo: str = "{}"):
+                     features: torch.Tensor = None, extra_info: str = "{}", batchInfo: str = "{}"):
         """
-        主函数：处理批量图片上传（支持特征向量 + 标签 + 总体信息）
+        主函数：处理批量图片上传（支持特征向量 + 扩展信息 + 总体信息）
         """
         
         # 🔧 解析总体信息 (JSON)
@@ -253,6 +258,15 @@ class ImageUploader:
             print(f"⚠️ batchInfo JSON 解析失败: {e}")
             batch_info_dict = {"raw_batch_info": batchInfo}
             
+        # 🔧 解析扩展信息 (JSON)
+        try:
+            extra_info_dict = json.loads(extra_info) if extra_info else {}
+        except Exception as e:
+            print(f"⚠️ extra_info JSON 解析失败: {e}")
+            extra_info_dict = {}
+
+        tags_list = extra_info_dict.get("tags", [])
+        titles_list = extra_info_dict.get("titles", [])
         # 🔧 类型适配：支持 CLIP_VISION_OUTPUT
         if isinstance(features, dict):
             if "image_embeds" in features:
@@ -284,9 +298,6 @@ class ImageUploader:
                 print(f"⚠️ 特征数量({len(feature_list)})与图片数量({batch_size})不匹配，将使用第一个特征")
                 feature_list = [feature_list[0]] * batch_size
         
-        # 🔹 解析标签
-        label_list = self.parse_labels(labels, batch_size)
-        
         results = []
         urls = []
         
@@ -298,14 +309,19 @@ class ImageUploader:
             pil_img = self.tensor_to_pil(single_tensor)
             img_bytes = self.pil_to_bytes(pil_img, format='PNG')
             
-            # 2. 获取当前图片的特征和标签
+            # 2. 获取当前图片的特征和扩展信息
             feat = feature_list[i] if feature_list else None
-            lbl = label_list[i] if label_list else None
+            
+            # 从 extra_info 获取当前图片的 tags 和 title
+            current_tags = tags_list[i] if i < len(tags_list) else None
+            current_title = titles_list[i] if i < len(titles_list) else None
             
             # 3. 调用 API 上传
             result = self.upload_single_image(
                 api_url, img_bytes, 'image/png',
-                feature_vec=feat, labels=lbl, 
+                feature_vec=feat, 
+                tags=current_tags,
+                title=current_title,
                 batch_info=batch_info_dict, index=i
             )
             results.append(result)
