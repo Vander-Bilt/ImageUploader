@@ -126,7 +126,11 @@ class ImageUploader:
         if features.dtype.is_floating_point:
             features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
     
-        # 🔹 6. 可选压缩
+        # 🔹 6. 归一化 (Cosine Similarity 必须)
+        features = features / torch.linalg.norm(features, dim=-1, keepdim=True)
+        print("✅ 向量归一化完成")
+
+        # 🔹 7. 可选压缩
         if compress and features.dtype == torch.float32:
             features = features.half()
             print("✅ 压缩: float32 → float16")
