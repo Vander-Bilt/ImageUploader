@@ -1,5 +1,6 @@
 """
 ImageUploaderNode - 将 ComfyUI 生成的图片上传到外部 API（支持特征向量 + 多标签）
+支持内部提取 Chinese-CLIP 特征或使用外部传入特征
 """
 import torch
 import numpy as np
@@ -8,11 +9,18 @@ import io
 import json
 import folder_paths
 from PIL import Image
+import os
+
+# 全局模型缓存
+_CHINESE_CLIP_MODEL = None
+_CHINESE_CLIP_PROCESSOR = None
 
 # 节点类
 class ImageUploader:
     def __init__(self):
         self.base_url = None
+        self.clip_model = None
+        self.clip_processor = None
         
     @classmethod
     def INPUT_TYPES(s):
@@ -26,6 +34,12 @@ class ImageUploader:
                 "upload_endpoint": ("STRING", {
                     "default": "/upload-image-binary",
                     "multiline": False
+                }),
+                # 🔹 新增：是否内部提取特征
+                "innerExtract": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "Use Chinese-CLIP",
+                    "label_off": "Use External Features"
                 }),
             },
             "optional": {
@@ -43,6 +57,13 @@ class ImageUploader:
                     "default": "{}",
                     "multiline": True,
                     "placeholder": 'e.g. {"host"":"neoc", "category":"风景", "collection":"公园", "style":"真实"}'
+                }),
+                
+                # 🔹 新增 4: Chinese-CLIP 模型配置（仅当 innerExtract=True 时生效）
+                "clip_model_name": ("STRING", {
+                    "default": "OFA-Sys/chinese-clip-vit-large-patch14",
+                    "multiline": False,
+                    "placeholder": "OFA-Sys/chinese-clip-vit-base-patch14"
                 }),
             }
         }
@@ -75,7 +96,106 @@ class ImageUploader:
         buffer.seek(0)
         return buffer.getvalue()
 
-    # 🔹 特征向量预处理
+    # 🔹 新增：加载 Chinese-CLIP 模型（单例模式）
+    def load_chinese_clip_model(self, model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14"):
+        """加载 Chinese-CLIP 模型，使用 safetensors 版本避开 torch.load 安全限制"""
+        global _CHINESE_CLIP_MODEL, _CHINESE_CLIP_PROCESSOR
+        
+        # 检查缓存
+        if _CHINESE_CLIP_MODEL is not None and _CHINESE_CLIP_PROCESSOR is not None:
+            print("✅ 使用缓存的 Chinese-CLIP 模型")
+            return _CHINESE_CLIP_MODEL, _CHINESE_CLIP_PROCESSOR
+        
+        try:
+            print(f"📥 正在加载 Chinese-CLIP 模型: {model_name}")
+            from transformers import ChineseCLIPModel, ChineseCLIPProcessor
+            
+            # 🔹 关键修复：指定 revision="cc2eeb8" 以加载包含 safetensors 的版本
+            # 参考: https://huggingface.co/OFA-Sys/chinese-clip-vit-large-patch14/tree/cc2eeb803885adc11690654a6e55fde2feeb7420
+            revision_with_safetensors = "cc2eeb803885adc11690654a6e55fde2feeb7420"
+            
+            print(f"🎯 使用 revision: {revision_with_safetensors} (包含 safetensors)")
+            
+            # 加载 Processor
+            _CHINESE_CLIP_PROCESSOR = ChineseCLIPProcessor.from_pretrained(
+                model_name,
+                revision=revision_with_safetensors,
+                use_safetensors=True
+            )
+            
+            # 加载 Model
+            _CHINESE_CLIP_MODEL = ChineseCLIPModel.from_pretrained(
+                model_name,
+                revision=revision_with_safetensors,
+                use_safetensors=True
+            )
+            
+            # 移到 GPU（如果可用）
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _CHINESE_CLIP_MODEL = _CHINESE_CLIP_MODEL.to(device)
+            _CHINESE_CLIP_MODEL.eval()
+            
+            print(f"✅ Chinese-CLIP 模型加载成功 (device: {device}, safetensors: True)")
+            return _CHINESE_CLIP_MODEL, _CHINESE_CLIP_PROCESSOR
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Chinese-CLIP 模型加载失败: {error_msg}")
+            
+            # 🔹 提供详细的故障排查建议
+            if "torch.load" in error_msg and "v2.6" in error_msg:
+                print("\n💡 解决方案:")
+                print("   1. 已自动使用 revision='cc2eeb8' (包含 safetensors)")
+                print("   2. 请检查 transformers 版本: pip install --upgrade transformers>=4.36.0")
+                print("   3. 或手动清理缓存后重试:")
+                print(f"      rm -rf ~/.cache/huggingface/hub/models--OFA-Sys--chinese-clip-vit-large-patch14")
+            elif "404" in error_msg or "Not Found" in error_msg:
+                print("\n💡 错误: 找不到指定的 revision")
+                print("   请检查网络连接或尝试:")
+                print(f"      huggingface-cli download {model_name} --revision {revision_with_safetensors}")
+            
+            raise e
+
+    # 🔹 新增：使用 Chinese-CLIP 提取图像特征
+    def extract_features_with_chinese_clip(self, images: torch.Tensor, model_name: str):
+        """
+        使用 Chinese-CLIP 提取图像特征向量
+        Args:
+            images: [B,H,W,C] tensor, 值域 [0,1]
+            model_name: 模型名称
+        Returns:
+            List of feature vectors (normalized)
+        """
+        print("🎯 开始使用 Chinese-CLIP 提取特征...")
+        
+        # 1. 加载模型
+        model, processor = self.load_chinese_clip_model(model_name)
+        device = next(model.parameters()).device
+        
+        # 2. 转换 PIL 图像
+        pil_images = []
+        for i in range(images.shape[0]):
+            pil_img = self.tensor_to_pil(images[i])
+            pil_images.append(pil_img)
+        
+        # 3. 使用 processor 处理图像（自动 resize/normalize）
+        inputs = processor(images=pil_images, return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # 4. 提取特征（禁用梯度）
+        with torch.no_grad():
+            image_features = model.get_image_features(**inputs)
+            # L2 归一化（Cosine Similarity 必须）
+            image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+        
+        # 5. 移到 CPU 并转 list
+        image_features = image_features.cpu()
+        feat_list = image_features.tolist()
+        
+        print(f"✅ Chinese-CLIP 特征提取完成: {len(feat_list)} 张图, 维度: {len(feat_list[0])}")
+        return feat_list
+
+    # 🔹 特征向量预处理（兼容外部传入的 features）
     def process_features(self, features, pool_mode: str = "cls", compress: bool = True):
         """增强版：兼容 comfy.clip_vision.Output 对象 + dict + Tensor"""
         print(f"🔍 [process_features] 1. 输入类型: {type(features)}")
@@ -249,9 +369,15 @@ class ImageUploader:
             }
 
     def upload_images(self, images: torch.Tensor, api_base_url: str, upload_endpoint: str,
-                     features: torch.Tensor = None, extra_info: str = "{}", batchInfo: str = "{}"):
+                     innerExtract: bool = False,
+                     features: torch.Tensor = None, extra_info: str = "{}", batchInfo: str = "{}",
+                     clip_model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14"):
         """
         主函数：处理批量图片上传（支持特征向量 + 扩展信息 + 总体信息）
+        
+        Args:
+            innerExtract: 如果为 True，使用 Chinese-CLIP 内部提取特征，忽略 features 参数
+            clip_model_name: Chinese-CLIP 模型名称（仅当 innerExtract=True 时生效）
         """
         
         # 🔧 解析总体信息 (JSON)
@@ -271,6 +397,7 @@ class ImageUploader:
 
         tags_list = extra_info_dict.get("tags", [])
         titles_list = extra_info_dict.get("titles", [])
+        
         # 🔧 类型适配：支持 CLIP_VISION_OUTPUT
         if isinstance(features, dict):
             if "image_embeds" in features:
@@ -291,16 +418,33 @@ class ImageUploader:
         batch_size = images.shape[0]
         print(f"📦 待上传图片数量: {batch_size}")
         
-        # 🔹 预处理特征向量
-        feature_list = self.process_features(features) if features is not None else None
-        if feature_list is not None:
-            # 如果特征数量与图片数量不匹配，尝试广播或报错
-            if len(feature_list) == 1 and batch_size > 1:
-                import copy
-                feature_list = [copy.deepcopy(feature_list[0]) for _ in range(batch_size)]
-            elif len(feature_list) != batch_size:
-                print(f"⚠️ 特征数量({len(feature_list)})与图片数量({batch_size})不匹配，将使用第一个特征")
-                feature_list = [feature_list[0]] * batch_size
+        # 🔹 特征提取逻辑分支
+        feature_list = None
+        
+        if innerExtract:
+            # 🔹 分支1: 使用 Chinese-CLIP 内部提取
+            print("🎯 模式: 内部提取 (Chinese-CLIP)")
+            try:
+                feature_list = self.extract_features_with_chinese_clip(images, clip_model_name)
+            except Exception as e:
+                print(f"❌ Chinese-CLIP 特征提取失败: {e}")
+                print("⚠️ 将继续上传但不包含特征向量")
+                feature_list = None
+        else:
+            # 🔹 分支2: 使用外部传入的 features
+            print("🎯 模式: 使用外部传入特征")
+            if features is not None:
+                feature_list = self.process_features(features)
+                if feature_list is not None:
+                    # 如果特征数量与图片数量不匹配，尝试广播或报错
+                    if len(feature_list) == 1 and batch_size > 1:
+                        import copy
+                        feature_list = [copy.deepcopy(feature_list[0]) for _ in range(batch_size)]
+                    elif len(feature_list) != batch_size:
+                        print(f"⚠️ 特征数量({len(feature_list)})与图片数量({batch_size})不匹配，将使用第一个特征")
+                        feature_list = [feature_list[0]] * batch_size
+            else:
+                print("⚠️ 未提供 features 参数，将不上传特征向量")
         
         results = []
         urls = []
