@@ -61,9 +61,16 @@ class ImageUploader:
                 
                 # 🔹 新增 4: Chinese-CLIP 模型配置（仅当 innerExtract=True 时生效）
                 "clip_model_name": ("STRING", {
-                    "default": "OFA-Sys/chinese-clip-vit-large-patch14",
+                    "default": "",
                     "multiline": False,
-                    "placeholder": "OFA-Sys/chinese-clip-vit-base-patch14"
+                    "placeholder": ""
+                }),
+                
+                # 🔹 新增 5: Chinese-CLIP 模型 revision（可选，为空则不指定）
+                "clip_model_revision": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "commit version"
                 }),
             }
         }
@@ -97,8 +104,15 @@ class ImageUploader:
         return buffer.getvalue()
 
     # 🔹 新增：加载 Chinese-CLIP 模型（单例模式）
-    def load_chinese_clip_model(self, model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14"):
-        """加载 Chinese-CLIP 模型，使用 safetensors 版本避开 torch.load 安全限制"""
+    def load_chinese_clip_model(self, model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14", 
+                                revision: str = ""):
+        """
+        加载 Chinese-CLIP 模型，使用 safetensors 版本避开 torch.load 安全限制
+        
+        Args:
+            model_name: 模型名称
+            revision: 模型版本（可选，为空则使用默认版本）
+        """
         global _CHINESE_CLIP_MODEL, _CHINESE_CLIP_PROCESSOR
         
         # 检查缓存
@@ -110,24 +124,28 @@ class ImageUploader:
             print(f"📥 正在加载 Chinese-CLIP 模型: {model_name}")
             from transformers import ChineseCLIPModel, ChineseCLIPProcessor
             
-            # 🔹 关键修复：指定 revision="cc2eeb8" 以加载包含 safetensors 的版本
-            # 参考: https://huggingface.co/OFA-Sys/chinese-clip-vit-large-patch14/tree/cc2eeb803885adc11690654a6e55fde2feeb7420
-            revision_with_safetensors = "cc2eeb803885adc11690654a6e55fde2feeb7420"
+            # 准备加载参数
+            load_kwargs = {
+                "use_safetensors": True
+            }
             
-            print(f"🎯 使用 revision: {revision_with_safetensors} (包含 safetensors)")
+            # 如果指定了 revision，则添加到参数中
+            if revision and revision.strip():
+                load_kwargs["revision"] = revision.strip()
+                print(f"🎯 使用指定的 revision: {revision}")
+            else:
+                print("🎯 使用默认 revision（最新版本）")
             
             # 加载 Processor
             _CHINESE_CLIP_PROCESSOR = ChineseCLIPProcessor.from_pretrained(
                 model_name,
-                revision=revision_with_safetensors,
-                use_safetensors=True
+                **load_kwargs
             )
             
             # 加载 Model
             _CHINESE_CLIP_MODEL = ChineseCLIPModel.from_pretrained(
                 model_name,
-                revision=revision_with_safetensors,
-                use_safetensors=True
+                **load_kwargs
             )
             
             # 移到 GPU（如果可用）
@@ -135,7 +153,8 @@ class ImageUploader:
             _CHINESE_CLIP_MODEL = _CHINESE_CLIP_MODEL.to(device)
             _CHINESE_CLIP_MODEL.eval()
             
-            print(f"✅ Chinese-CLIP 模型加载成功 (device: {device}, safetensors: True)")
+            revision_info = f"revision={revision}" if revision else "默认版本"
+            print(f"✅ Chinese-CLIP 模型加载成功 (device: {device}, {revision_info}, safetensors: True)")
             return _CHINESE_CLIP_MODEL, _CHINESE_CLIP_PROCESSOR
             
         except Exception as e:
@@ -145,31 +164,35 @@ class ImageUploader:
             # 🔹 提供详细的故障排查建议
             if "torch.load" in error_msg and "v2.6" in error_msg:
                 print("\n💡 解决方案:")
-                print("   1. 已自动使用 revision='cc2eeb8' (包含 safetensors)")
+                print("   1. 尝试指定包含 safetensors 的 revision")
+                print("      例如: cc2eeb803885adc11690654a6e55fde2feeb7420")
                 print("   2. 请检查 transformers 版本: pip install --upgrade transformers>=4.36.0")
                 print("   3. 或手动清理缓存后重试:")
                 print(f"      rm -rf ~/.cache/huggingface/hub/models--OFA-Sys--chinese-clip-vit-large-patch14")
             elif "404" in error_msg or "Not Found" in error_msg:
                 print("\n💡 错误: 找不到指定的 revision")
                 print("   请检查网络连接或尝试:")
-                print(f"      huggingface-cli download {model_name} --revision {revision_with_safetensors}")
+                print(f"      huggingface-cli download {model_name}")
+                if revision:
+                    print(f"      或指定 revision: --revision {revision}")
             
             raise e
 
     # 🔹 新增：使用 Chinese-CLIP 提取图像特征
-    def extract_features_with_chinese_clip(self, images: torch.Tensor, model_name: str):
+    def extract_features_with_chinese_clip(self, images: torch.Tensor, model_name: str, revision: str = ""):
         """
         使用 Chinese-CLIP 提取图像特征向量
         Args:
             images: [B,H,W,C] tensor, 值域 [0,1]
             model_name: 模型名称
+            revision: 模型版本（可选）
         Returns:
             List of feature vectors (normalized)
         """
         print("🎯 开始使用 Chinese-CLIP 提取特征...")
         
         # 1. 加载模型
-        model, processor = self.load_chinese_clip_model(model_name)
+        model, processor = self.load_chinese_clip_model(model_name, revision)
         device = next(model.parameters()).device
         
         # 2. 转换 PIL 图像
@@ -306,7 +329,8 @@ class ImageUploader:
                           content_type: str, feature_vec: list = None, 
                           tags: list = None, title: str = None,
                           batch_info: dict = None,
-                          index: int = 0) -> dict:
+                          index: int = 0,
+                          msg: str = None) -> dict:
         """调用后端 API 上传单个图片（支持 multipart + JSON 混合）"""
         
         # 方案: 使用 multipart/form-data 同时发送文件和元数据
@@ -326,6 +350,8 @@ class ImageUploader:
             metadata['title'] = title
         if batch_info is not None:
             metadata['batch_info'] = batch_info
+        if msg is not None:
+            metadata['msg'] = msg
         metadata['index'] = index  # 图片在 batch 中的序号
         
         
@@ -371,13 +397,15 @@ class ImageUploader:
     def upload_images(self, images: torch.Tensor, api_base_url: str, upload_endpoint: str,
                      innerExtract: bool = False,
                      features: torch.Tensor = None, extra_info: str = "{}", batchInfo: str = "{}",
-                     clip_model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14"):
+                     clip_model_name: str = "OFA-Sys/chinese-clip-vit-large-patch14",
+                     clip_model_revision: str = ""):
         """
         主函数：处理批量图片上传（支持特征向量 + 扩展信息 + 总体信息）
         
         Args:
             innerExtract: 如果为 True，使用 Chinese-CLIP 内部提取特征，忽略 features 参数
             clip_model_name: Chinese-CLIP 模型名称（仅当 innerExtract=True 时生效）
+            clip_model_revision: Chinese-CLIP 模型版本（可选，为空则使用默认版本）
         """
         
         # 🔧 解析总体信息 (JSON)
@@ -420,19 +448,23 @@ class ImageUploader:
         
         # 🔹 特征提取逻辑分支
         feature_list = None
+        extract_method = ""  # 记录特征提取方法
         
         if innerExtract:
             # 🔹 分支1: 使用 Chinese-CLIP 内部提取
             print("🎯 模式: 内部提取 (Chinese-CLIP)")
+            extract_method = "Chinese-CLIP内部提取"
             try:
-                feature_list = self.extract_features_with_chinese_clip(images, clip_model_name)
+                feature_list = self.extract_features_with_chinese_clip(images, clip_model_name, clip_model_revision)
             except Exception as e:
                 print(f"❌ Chinese-CLIP 特征提取失败: {e}")
                 print("⚠️ 将继续上传但不包含特征向量")
                 feature_list = None
+                extract_method = "Chinese-CLIP内部提取失败"
         else:
             # 🔹 分支2: 使用外部传入的 features
             print("🎯 模式: 使用外部传入特征")
+            extract_method = "外部传入特征"
             if features is not None:
                 feature_list = self.process_features(features)
                 if feature_list is not None:
@@ -443,8 +475,21 @@ class ImageUploader:
                     elif len(feature_list) != batch_size:
                         print(f"⚠️ 特征数量({len(feature_list)})与图片数量({batch_size})不匹配，将使用第一个特征")
                         feature_list = [feature_list[0]] * batch_size
+                else:
+                    extract_method = "外部特征处理失败"
             else:
                 print("⚠️ 未提供 features 参数，将不上传特征向量")
+                extract_method = "未提供外部特征"
+        
+        # 构建消息字符串
+        msg = f"特征提取方式: {extract_method}"
+        if innerExtract and clip_model_name:
+            msg += f" | 模型: {clip_model_name}"
+            if clip_model_revision:
+                msg += f" | 版本: {clip_model_revision}"
+        msg += f" | 批次大小: {batch_size}"
+        
+        print(f"📝 上传消息: {msg}")
         
         results = []
         urls = []
@@ -470,7 +515,9 @@ class ImageUploader:
                 feature_vec=feat, 
                 tags=current_tags,
                 title=current_title,
-                batch_info=batch_info_dict, index=i
+                batch_info=batch_info_dict, 
+                index=i,
+                msg=msg  # 传递消息
             )
             results.append(result)
             
